@@ -13,7 +13,7 @@
   "keywords": [],
   "author": "Jhenbert",
   "license": "MIT",
-  "packageManager": "pnpm@10.12.4",
+  "packageManager": "pnpm@10.14.0",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.17.2",
     "openmeteo": "^1.2.0",
