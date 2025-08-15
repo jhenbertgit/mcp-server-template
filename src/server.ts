@@ -431,8 +431,9 @@ async function main() {
       const origin = req.headers["origin"] as string | undefined;
       if (
         origin &&
-        !/^https?:\/\/localhost(?::\d+)?$/.test(origin) &&
-        !/^https?:\/\/127\.0\.0\.1(?::\d+)?$/.test(origin)
+        !/^https?:\/\/localhost(?:\:\d+)?$/.test(origin) &&
+        !/^https?:\/\/127\.0\.0\.1(?:\:\d+)?$/.test(origin) &&
+        !/^https?:\/\/0\.0\.0\.0(?:\:\d+)?$/.test(origin)
       ) {
         res.statusCode = 403;
         res.setHeader("Content-Type", "application/json");
