@@ -12,6 +12,46 @@ import * as dotenv from "dotenv";
 
 dotenv.config();
 
+// Define the port for the HTTP server
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+
+const WEATHER_TOOL_DEFINITION = {
+  name: "get_weather",
+  description:
+    "Get weather for a city. Provide 'city', optional 'units' (metric|imperial), and optional 'mode' ('current' | 'hourly' | 'daily'). For daily, you can also set 'days' (7-10).",
+  inputSchema: {
+    type: "object",
+    properties: {
+      city: { type: "string", description: "City name to query" },
+      units: {
+        type: "string",
+        description: "Units system (metric or imperial)",
+        enum: ["metric", "imperial"],
+      },
+      mode: {
+        type: "string",
+        description:
+          "Data mode: 'current' (default), 'hourly' (next ~24h), or 'daily' (next 7-10 days)",
+        enum: ["current", "hourly", "daily"],
+      },
+      days: {
+        type: "number",
+        description:
+          "For daily mode only: number of forecast days (7-10). Defaults to 7.",
+        minimum: 1,
+        maximum: 16,
+      },
+      format: {
+        type: "string",
+        description:
+          "Response format: 'json' (default) or 'text' (compat mode returning stringified JSON)",
+        enum: ["json", "text"],
+      },
+    },
+    required: ["city"],
+  },
+};
+
 // Basic MCP server template using stdio transport
 async function main() {
   const server = new Server(
@@ -60,44 +100,7 @@ async function main() {
   // Advertise available tools
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     return {
-      tools: [
-        {
-          name: "get_weather",
-          description:
-            "Get weather for a city. Provide 'city', optional 'units' (metric|imperial), and optional 'mode' ('current' | 'hourly' | 'daily'). For daily, you can also set 'days' (7-10).",
-          inputSchema: {
-            type: "object",
-            properties: {
-              city: { type: "string", description: "City name to query" },
-              units: {
-                type: "string",
-                description: "Units system (metric or imperial)",
-                enum: ["metric", "imperial"],
-              },
-              mode: {
-                type: "string",
-                description:
-                  "Data mode: 'current' (default), 'hourly' (next ~24h), or 'daily' (next 7-10 days)",
-                enum: ["current", "hourly", "daily"],
-              },
-              days: {
-                type: "number",
-                description:
-                  "For daily mode only: number of forecast days (7-10). Defaults to 7.",
-                minimum: 1,
-                maximum: 16,
-              },
-              format: {
-                type: "string",
-                description:
-                  "Response format: 'json' (default) or 'text' (compat mode returning stringified JSON)",
-                enum: ["json", "text"],
-              },
-            },
-            required: ["city"],
-          },
-        },
-      ],
+      tools: [WEATHER_TOOL_DEFINITION],
     };
   });
 
@@ -164,7 +167,7 @@ async function main() {
       return {
         content: wrap("json", {
           error: "invalid_arguments",
-          issues: z.treeifyError(parsed.error),
+          issues: (parsed.error as any).issues || parsed.error.format(),
         }),
         isError: true,
       };
@@ -193,21 +196,49 @@ async function main() {
         longitude: geo.longitude,
         timezone: "auto",
       };
-      if (mode === "current") {
-        params["current"] = ["temperature_2m", "wind_speed_10m"];
-      } else if (mode === "hourly") {
-        params["hourly"] = ["temperature_2m", "wind_speed_10m"];
-        params["past_days"] = 0;
-        params["forecast_days"] = 2;
-      } else if (mode === "daily") {
-        params["daily"] = [
-          "temperature_2m_max",
-          "temperature_2m_min",
-          "precipitation_sum",
-          "wind_speed_10m_max",
-        ];
-        params["forecast_days"] = days ?? 7;
+
+      // Configure parameters based on mode
+      switch (mode) {
+        case "current":
+          params["current"] = [
+            "rain",
+            "temperature_2m",
+            "relative_humidity_2m",
+            "precipitation",
+            "weather_code",
+            "showers",
+            "wind_speed_10m",
+          ];
+          break;
+        case "hourly":
+          params["hourly"] = [
+            "temperature_2m",
+            "wind_speed_10m",
+            "weather_code",
+            "relative_humidity_2m",
+            "precipitation",
+            "precipitation_probability",
+          ];
+          params["past_days"] = 0;
+          params["forecast_days"] = 2;
+          break;
+        case "daily":
+          params["daily"] = [
+            "weather_code",
+            "temperature_2m_max",
+            "temperature_2m_min",
+            "sunrise",
+            "sunset",
+            "rain_sum",
+            "showers_sum",
+            "precipitation_sum",
+            "precipitation_hours",
+          ];
+          params["forecast_days"] = days ?? 7;
+          break;
       }
+
+      // Configure units
       if (units === "imperial") {
         params["temperature_unit"] = "fahrenheit";
         params["windspeed_unit"] = "mph";
@@ -224,159 +255,37 @@ async function main() {
         return { content: wrap(format, { error: "no_data" }), isError: true };
       }
 
-      const tempUnit = units === "imperial" ? "°F" : "°C";
-      const windUnit = units === "imperial" ? "mph" : "km/h";
+      const tempUnit = units === "imperial" ? "fahrenheit" : "celsius";
+      const windUnit = units === "imperial" ? "mph" : "kmh";
 
       opts?.onProgress?.("assembling_output");
 
-      if (mode === "current") {
-        const current = response.current();
-        if (!current) {
+      // Process based on mode
+      switch (mode) {
+        case "current":
+          return processCurrentWeather(
+            response,
+            geo,
+            format,
+            tempUnit,
+            windUnit
+          );
+        case "hourly":
+          return processHourlyWeather(
+            response,
+            geo,
+            format,
+            tempUnit,
+            windUnit
+          );
+        case "daily":
+          return processDailyWeather(response, geo, format, tempUnit, days);
+        default:
           return {
-            content: wrap(format, { error: "missing_current" }),
+            content: wrap(format, { error: "unsupported_mode" }),
             isError: true,
           };
-        }
-        const temperature = current.variables(0)?.value();
-        const windSpeed = current.variables(1)?.value();
-        const t =
-          typeof temperature === "number" && Number.isFinite(temperature)
-            ? Number(temperature.toFixed(1))
-            : null;
-        const w =
-          typeof windSpeed === "number" && Number.isFinite(windSpeed)
-            ? Number(windSpeed.toFixed(1))
-            : null;
-        return {
-          content: wrap(format, {
-            location: geo.displayName,
-            latitude: geo.latitude,
-            longitude: geo.longitude,
-            units,
-            mode,
-            current: {
-              temperature: t,
-              temperature_unit: tempUnit,
-              wind_speed: w,
-              wind_speed_unit: windUnit,
-            },
-          }),
-          isError: false,
-        };
       }
-
-      if (mode === "hourly") {
-        const hourly = response.hourly();
-        if (!hourly) {
-          return {
-            content: wrap(format, { error: "missing_hourly" }),
-            isError: true,
-          };
-        }
-        const start = Number(hourly.time());
-        const end = Number(hourly.timeEnd());
-        const interval = hourly.interval();
-        const count = (end - start) / interval;
-        const times = Array.from(
-          { length: count },
-          (_, i) =>
-            new Date(
-              (start + i * interval + response.utcOffsetSeconds()) * 1000
-            )
-        );
-        const temp = hourly.variables(0)?.valuesArray() ?? [];
-        const wind = hourly.variables(1)?.valuesArray() ?? [];
-        const max = Math.min(24, temp.length, wind.length, times.length);
-        const items = Array.from({ length: max }, (_, i) => ({
-          time_iso: times[i].toISOString(),
-          temperature:
-            typeof temp[i] === "number"
-              ? Number(Number(temp[i]).toFixed(1))
-              : null,
-          temperature_unit: tempUnit,
-          wind_speed:
-            typeof wind[i] === "number"
-              ? Number(Number(wind[i]).toFixed(1))
-              : null,
-          wind_speed_unit: windUnit,
-        }));
-        return {
-          content: wrap(format, {
-            location: geo.displayName,
-            latitude: geo.latitude,
-            longitude: geo.longitude,
-            units,
-            mode,
-            hourly_next_24h: items,
-          }),
-          isError: false,
-        };
-      }
-
-      // daily
-      const daily = response.daily();
-      if (!daily) {
-        return {
-          content: wrap(format, { error: "missing_daily" }),
-          isError: true,
-        };
-      }
-      const dStart = Number(daily.time());
-      const dEnd = Number(daily.timeEnd());
-      const dInterval = daily.interval();
-      const dCount = (dEnd - dStart) / dInterval;
-      const dTimes = Array.from(
-        { length: dCount },
-        (_, i) =>
-          new Date(
-            (dStart + i * dInterval + response.utcOffsetSeconds()) * 1000
-          )
-      );
-      const tMax = daily.variables(0)?.valuesArray() ?? [];
-      const tMin = daily.variables(1)?.valuesArray() ?? [];
-      const precip = daily.variables(2)?.valuesArray() ?? [];
-      const windMax = daily.variables(3)?.valuesArray() ?? [];
-      const dMax = Math.min(
-        tMax.length,
-        tMin.length,
-        precip.length,
-        windMax.length,
-        dTimes.length
-      );
-      const daysOut = Array.from({ length: dMax }, (_, i) => ({
-        date: dTimes[i].toISOString().slice(0, 10),
-        t_max:
-          typeof tMax[i] === "number"
-            ? Number(Number(tMax[i]).toFixed(1))
-            : null,
-        t_min:
-          typeof tMin[i] === "number"
-            ? Number(Number(tMin[i]).toFixed(1))
-            : null,
-        temperature_unit: tempUnit,
-        precipitation_sum:
-          typeof precip[i] === "number"
-            ? Number(Number(precip[i]).toFixed(1))
-            : null,
-        precipitation_unit: "mm",
-        wind_speed_10m_max:
-          typeof windMax[i] === "number"
-            ? Number(Number(windMax[i]).toFixed(1))
-            : null,
-        wind_speed_unit: windUnit,
-      }));
-      return {
-        content: wrap(format, {
-          location: geo.displayName,
-          latitude: geo.latitude,
-          longitude: geo.longitude,
-          units,
-          mode,
-          days: days ?? null,
-          daily: daysOut,
-        }),
-        isError: false,
-      };
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
       return {
@@ -384,6 +293,233 @@ async function main() {
         isError: true,
       };
     }
+  }
+
+  // Extracted helper functions for better organization
+  function processCurrentWeather(
+    response: any,
+    geo: any,
+    format: "json" | "text",
+    tempUnit: string,
+    windUnit: string
+  ): ToolResult {
+    const current = response.current();
+    if (!current) {
+      return {
+        content: wrap(format, { error: "missing_current" }),
+        isError: true,
+      };
+    }
+
+    const rain = current.variables(0)?.value();
+    const temperature = current.variables(1)?.value();
+    const relativeHumidity = current.variables(2)?.value();
+    const precipitation = current.variables(3)?.value();
+    const weatherCode = current.variables(4)?.value();
+    const showers = current.variables(5)?.value();
+    const wind = current.variables(6)?.value();
+
+    const t =
+      typeof temperature === "number" && Number.isFinite(temperature)
+        ? Number(temperature.toFixed(1))
+        : null;
+    const rh =
+      typeof relativeHumidity === "number" && Number.isFinite(relativeHumidity)
+        ? Number(relativeHumidity.toFixed(1))
+        : null;
+    const p =
+      typeof precipitation === "number" && Number.isFinite(precipitation)
+        ? Number(precipitation.toFixed(1))
+        : null;
+    const s =
+      typeof showers === "number" && Number.isFinite(showers)
+        ? Number(showers.toFixed(1))
+        : null;
+    const w =
+      typeof wind === "number" && Number.isFinite(wind)
+        ? Number(wind.toFixed(1))
+        : null;
+
+    return {
+      content: wrap(format, {
+        location: geo.displayName,
+        latitude: geo.latitude,
+        longitude: geo.longitude,
+        units: tempUnit === "fahrenheit" ? "imperial" : "metric",
+        mode: "current",
+        days: 1,
+        current: {
+          temperature: t,
+          temperature_unit: tempUnit,
+          rain: rain,
+          relative_humidity: rh,
+          precipitation: p,
+          weather_code: weatherCode,
+          showers: s,
+          wind: w,
+          wind_unit: windUnit,
+        },
+      }),
+      isError: false,
+    };
+  }
+
+  function processHourlyWeather(
+    response: any,
+    geo: any,
+    format: "json" | "text",
+    tempUnit: string,
+    windUnit: string
+  ): ToolResult {
+    const hourly = response.hourly();
+    if (!hourly) {
+      return {
+        content: wrap(format, { error: "missing_hourly" }),
+        isError: true,
+      };
+    }
+
+    const start = Number(hourly.time());
+    const end = Number(hourly.timeEnd());
+    const interval = hourly.interval();
+    const count = (end - start) / interval;
+    const times = Array.from(
+      { length: count },
+      (_, i) =>
+        new Date((start + i * interval + response.utcOffsetSeconds()) * 1000)
+    );
+
+    const temp = hourly.variables(0)?.valuesArray() ?? [];
+    const wind = hourly.variables(1)?.valuesArray() ?? [];
+    const weatherCode = hourly.variables(2)?.valuesArray() ?? [];
+    const relativeHumidity = hourly.variables(3)?.valuesArray() ?? [];
+    const precipitation = hourly.variables(4)?.valuesArray() ?? [];
+    const precipitationProbability = hourly.variables(5)?.valuesArray() ?? [];
+
+    const max = Math.min(24, temp.length, wind.length, times.length);
+
+    const items = Array.from({ length: max }, (_, i) => ({
+      time_iso: times[i].toISOString(),
+      temperature:
+        typeof temp[i] === "number" ? Number(Number(temp[i]).toFixed(1)) : null,
+      temperature_unit: tempUnit,
+      relative_humidity:
+        typeof relativeHumidity[i] === "number"
+          ? Number(Number(relativeHumidity[i]).toFixed(1))
+          : null,
+      precipitation:
+        typeof precipitation[i] === "number"
+          ? Number(Number(precipitation[i]).toFixed(1))
+          : null,
+      precipitation_probability:
+        typeof precipitationProbability[i] === "number"
+          ? Number(Number(precipitationProbability[i]).toFixed(1))
+          : null,
+      weather_code:
+        typeof weatherCode[i] === "number"
+          ? Number(Number(weatherCode[i]).toFixed(1))
+          : null,
+      wind:
+        typeof wind[i] === "number" ? Number(Number(wind[i]).toFixed(1)) : null,
+      wind_unit: windUnit,
+    }));
+
+    return {
+      content: wrap(format, {
+        location: geo.displayName,
+        latitude: geo.latitude,
+        longitude: geo.longitude,
+        units: tempUnit === "fahrenheit" ? "imperial" : "metric",
+        mode: "hourly",
+        days: 1,
+        hourly: items,
+      }),
+      isError: false,
+    };
+  }
+
+  function processDailyWeather(
+    response: any,
+    geo: any,
+    format: "json" | "text",
+    tempUnit: string,
+    days?: number
+  ): ToolResult {
+    const daily = response.daily();
+    if (!daily) {
+      return {
+        content: wrap(format, { error: "missing_daily" }),
+        isError: true,
+      };
+    }
+
+    const dailyStart = Number(daily.time());
+    const dailyEnd = Number(daily.timeEnd());
+    const dailyInterval = daily.interval();
+    const dailyCount = (dailyEnd - dailyStart) / dailyInterval;
+
+    // Get all daily values at once for better performance
+    const dailyWeatherCodes = daily.variables(0)?.valuesArray() ?? [];
+    const dailyTempsMax = daily.variables(1)?.valuesArray() ?? [];
+    const dailyTempsMin = daily.variables(2)?.valuesArray() ?? [];
+    const dailySunrise = daily.variables(3)?.valuesArray() ?? [];
+    const dailySunset = daily.variables(4)?.valuesArray() ?? [];
+    const dailyRain = daily.variables(5)?.valuesArray() ?? [];
+    const dailyShowers = daily.variables(6)?.valuesArray() ?? [];
+    const dailyPrecip = daily.variables(7)?.valuesArray() ?? [];
+    const dailyPrecipHours = daily.variables(8)?.valuesArray() ?? [];
+
+    const dailyData = Array.from({ length: dailyCount }, (_, i) => {
+      const dayTime = new Date(
+        (dailyStart + i * dailyInterval + response.utcOffsetSeconds()) * 1000
+      );
+      return {
+        date: dayTime.toISOString().slice(0, 10),
+        weather_code:
+          i < dailyWeatherCodes.length ? dailyWeatherCodes[i] : null,
+        temperature_max:
+          i < dailyTempsMax.length ? Number(dailyTempsMax[i].toFixed(1)) : null,
+        temperature_min:
+          i < dailyTempsMin.length ? Number(dailyTempsMin[i].toFixed(1)) : null,
+        temperature_unit: tempUnit,
+        sunrise:
+          i < dailySunrise.length
+            ? new Date(
+                (Number(dailySunrise[i]) + response.utcOffsetSeconds()) * 1000
+              ).toISOString()
+            : null,
+        sunset:
+          i < dailySunset.length
+            ? new Date(
+                (Number(dailySunset[i]) + response.utcOffsetSeconds()) * 1000
+              ).toISOString()
+            : null,
+        rain_sum: i < dailyRain.length ? Number(dailyRain[i].toFixed(1)) : null,
+        showers_sum:
+          i < dailyShowers.length ? Number(dailyShowers[i].toFixed(1)) : null,
+        precipitation_sum:
+          i < dailyPrecip.length ? Number(dailyPrecip[i].toFixed(1)) : null,
+        precipitation_hours:
+          i < dailyPrecipHours.length ? dailyPrecipHours[i] : null,
+      };
+    });
+
+    return {
+      content: wrap(format, {
+        location: geo.displayName,
+        latitude: geo.latitude,
+        longitude: geo.longitude,
+        elevation: response.elevation(),
+        timezone: response.timezone(),
+        timezone_abbreviation: response.timezoneAbbreviation(),
+        utc_offset_seconds: response.utcOffsetSeconds(),
+        units: tempUnit === "fahrenheit" ? "imperial" : "metric",
+        mode: "daily",
+        days: days ?? 7,
+        daily: dailyData,
+      }),
+      isError: false,
+    };
   }
 
   // Handle tool calls
@@ -409,13 +545,26 @@ async function main() {
   await server.connect(transport);
 
   // Lightweight HTTP server with JSON and SSE streaming support
-  const port = Number(process.env.PORT ?? 5000);
   const sseHeaders = {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
     Connection: "keep-alive",
     "Access-Control-Allow-Origin": "*",
   } as const;
+
+  // Helper function to parse URL search params
+  const parseSearchParams = (url: string) => {
+    const urlObj = new URL(url, `http://localhost:${PORT}`);
+    return {
+      city: urlObj.searchParams.get("city") ?? undefined,
+      units: urlObj.searchParams.get("units") ?? undefined,
+      mode: urlObj.searchParams.get("mode") ?? undefined,
+      days: urlObj.searchParams.get("days")
+        ? Number(urlObj.searchParams.get("days"))
+        : undefined,
+      format: urlObj.searchParams.get("format") ?? undefined,
+    };
+  };
 
   const httpServer = http.createServer(async (req, res) => {
     try {
@@ -424,7 +573,8 @@ async function main() {
         res.end("Bad Request");
         return;
       }
-      const urlObj = new URL(req.url, "http://localhost");
+
+      const urlObj = new URL(req.url, `http://localhost:${PORT}`);
       const pathname = urlObj.pathname;
 
       // Basic Origin validation (local-only) to mitigate DNS rebinding per MCP guidance
@@ -521,55 +671,9 @@ async function main() {
           }
 
           if (method === "tools/list") {
-            // Reuse the handler used by stdio transport
-            const list = await (async () => {
-              const out = await (async () => {
-                return {
-                  tools: [
-                    {
-                      name: "get_weather",
-                      description:
-                        "Get weather for a city. Provide 'city', optional 'units' (metric|imperial), and optional 'mode' ('current' | 'hourly' | 'daily'). For daily, you can also set 'days' (7-10).",
-                      inputSchema: {
-                        type: "object",
-                        properties: {
-                          city: {
-                            type: "string",
-                            description: "City name to query",
-                          },
-                          units: {
-                            type: "string",
-                            description: "Units system (metric or imperial)",
-                            enum: ["metric", "imperial"],
-                          },
-                          mode: {
-                            type: "string",
-                            description:
-                              "Data mode: 'current' (default), 'hourly' (next ~24h), or 'daily' (next 7-10 days)",
-                            enum: ["current", "hourly", "daily"],
-                          },
-                          days: {
-                            type: "number",
-                            description:
-                              "For daily mode only: number of forecast days (7-10). Defaults to 7.",
-                            minimum: 1,
-                            maximum: 16,
-                          },
-                          format: {
-                            type: "string",
-                            description:
-                              "Response format: 'json' (default) or 'text' (compat mode returning stringified JSON)",
-                            enum: ["json", "text"],
-                          },
-                        },
-                        required: ["city"],
-                      },
-                    },
-                  ],
-                };
-              })();
-              return out;
-            })();
+            const list = {
+              tools: [WEATHER_TOOL_DEFINITION],
+            };
             jsonOk({ jsonrpc: "2.0", id, result: list });
             return;
           }
@@ -622,15 +726,7 @@ async function main() {
 
       // JSON non-stream endpoint: /get_weather?city=...&units=...&mode=...&days=...&format=...
       if (req.method === "GET" && pathname === "/get_weather") {
-        const args = {
-          city: urlObj.searchParams.get("city") ?? undefined,
-          units: urlObj.searchParams.get("units") ?? undefined,
-          mode: urlObj.searchParams.get("mode") ?? undefined,
-          days: urlObj.searchParams.get("days")
-            ? Number(urlObj.searchParams.get("days"))
-            : undefined,
-          format: urlObj.searchParams.get("format") ?? undefined,
-        };
+        const args = parseSearchParams(req.url);
         const out = await handleGetWeather(args);
         const payload =
           out.content[0].type === "json"
@@ -654,25 +750,7 @@ async function main() {
           res.write(`data: ${JSON.stringify(data)}\n\n`);
         };
         send("ready", { ok: true });
-        const args = {
-          city:
-            new URL(req.url, "http://localhost").searchParams.get("city") ??
-            undefined,
-          units:
-            new URL(req.url, "http://localhost").searchParams.get("units") ??
-            undefined,
-          mode:
-            new URL(req.url, "http://localhost").searchParams.get("mode") ??
-            undefined,
-          days: new URL(req.url, "http://localhost").searchParams.get("days")
-            ? Number(
-                new URL(req.url, "http://localhost").searchParams.get("days")
-              )
-            : undefined,
-          format:
-            new URL(req.url, "http://localhost").searchParams.get("format") ??
-            undefined,
-        };
+        const args = parseSearchParams(req.url);
         const out = await handleGetWeather(args, {
           onProgress: (msg) => send("progress", { message: msg }),
         });
@@ -690,6 +768,7 @@ async function main() {
       res.setHeader("Content-Type", "application/json");
       res.end(JSON.stringify({ error: "not_found" }));
     } catch (err) {
+      console.error("HTTP server error:", err);
       res.statusCode = 500;
       res.setHeader("Content-Type", "application/json");
       res.end(
@@ -701,9 +780,11 @@ async function main() {
     }
   });
 
-  httpServer.listen(port, () => {
-    console.log(`HTTP server listening on http://localhost:${port}`);
+  httpServer.listen(PORT, "0.0.0.0", () => {
+    console.log(`HTTP server running on http://0.0.0.0:${PORT}`);
   });
+
+  console.log("MCP server started");
 
   // Graceful shutdown
   const shutdown = async () => {
