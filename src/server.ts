@@ -8,6 +8,9 @@ import {
 import { fetchWeatherApi } from "openmeteo";
 import { z } from "zod";
 import * as http from "node:http";
+import * as dotenv from "dotenv";
+
+dotenv.config();
 
 // Basic MCP server template using stdio transport
 async function main() {
@@ -406,7 +409,7 @@ async function main() {
   await server.connect(transport);
 
   // Lightweight HTTP server with JSON and SSE streaming support
-  const port = Number(process.env.PORT ?? 3000);
+  const port = Number(process.env.PORT ?? 5000);
   const sseHeaders = {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
@@ -423,6 +426,191 @@ async function main() {
       }
       const urlObj = new URL(req.url, "http://localhost");
       const pathname = urlObj.pathname;
+
+      // Basic Origin validation (local-only) to mitigate DNS rebinding per MCP guidance
+      const origin = req.headers["origin"] as string | undefined;
+      if (
+        origin &&
+        !/^https?:\/\/localhost(?::\d+)?$/.test(origin) &&
+        !/^https?:\/\/127\.0\.0\.1(?::\d+)?$/.test(origin)
+      ) {
+        res.statusCode = 403;
+        res.setHeader("Content-Type", "application/json");
+        res.end(
+          JSON.stringify({ error: "forbidden", message: "Invalid Origin" })
+        );
+        return;
+      }
+
+      // Minimal JSON-RPC helpers for MCP-over-HTTP
+      const jsonOk = (payload: unknown) => {
+        res.writeHead(200, {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*",
+        });
+        res.end(JSON.stringify(payload));
+      };
+      const jsonErr = (status: number, payload: unknown) => {
+        res.writeHead(status, {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*",
+        });
+        res.end(JSON.stringify(payload));
+      };
+
+      // MCP Streamable HTTP endpoint
+      if (pathname === "/mcp") {
+        if (req.method === "GET") {
+          // Open SSE stream for server-initiated notifications
+          res.writeHead(200, sseHeaders);
+          const keepAlive = setInterval(() => {
+            res.write(": keep-alive\n\n");
+          }, 15000);
+          req.on("close", () => clearInterval(keepAlive));
+          return;
+        }
+        if (req.method === "POST") {
+          // Per spec: client sends JSON-RPC messages via POST
+          const chunks: Buffer[] = [];
+          for await (const chunk of req) chunks.push(chunk as Buffer);
+          const raw = Buffer.concat(chunks).toString("utf8");
+          let msg: any;
+          try {
+            msg = JSON.parse(raw);
+          } catch {
+            jsonErr(400, { error: { code: -32700, message: "Parse error" } });
+            return;
+          }
+
+          const isRequest = typeof msg?.method === "string" && "id" in msg;
+          const isNotification =
+            typeof msg?.method === "string" && !("id" in msg);
+          const isResponse =
+            !msg?.method && ("result" in msg || "error" in msg) && "id" in msg;
+
+          // For notifications or responses from client: 202 Accepted with no body
+          if (isNotification || isResponse) {
+            res.writeHead(202);
+            res.end();
+            return;
+          }
+
+          if (!isRequest) {
+            jsonErr(400, {
+              error: { code: -32600, message: "Invalid Request" },
+            });
+            return;
+          }
+
+          const id = msg.id;
+          const method = msg.method as string;
+          const params = (msg.params ?? {}) as Record<string, unknown>;
+
+          // Handle minimal MCP methods used by this server
+          if (method === "initialize") {
+            jsonOk({
+              jsonrpc: "2.0",
+              id,
+              result: {
+                serverInfo: { name: "local-mcp-server", version: "0.1.0" },
+                capabilities: { tools: {}, resources: {}, prompts: {} },
+              },
+            });
+            return;
+          }
+
+          if (method === "tools/list") {
+            // Reuse the handler used by stdio transport
+            const list = await (async () => {
+              const out = await (async () => {
+                return {
+                  tools: [
+                    {
+                      name: "get_weather",
+                      description:
+                        "Get weather for a city. Provide 'city', optional 'units' (metric|imperial), and optional 'mode' ('current' | 'hourly' | 'daily'). For daily, you can also set 'days' (7-10).",
+                      inputSchema: {
+                        type: "object",
+                        properties: {
+                          city: {
+                            type: "string",
+                            description: "City name to query",
+                          },
+                          units: {
+                            type: "string",
+                            description: "Units system (metric or imperial)",
+                            enum: ["metric", "imperial"],
+                          },
+                          mode: {
+                            type: "string",
+                            description:
+                              "Data mode: 'current' (default), 'hourly' (next ~24h), or 'daily' (next 7-10 days)",
+                            enum: ["current", "hourly", "daily"],
+                          },
+                          days: {
+                            type: "number",
+                            description:
+                              "For daily mode only: number of forecast days (7-10). Defaults to 7.",
+                            minimum: 1,
+                            maximum: 16,
+                          },
+                          format: {
+                            type: "string",
+                            description:
+                              "Response format: 'json' (default) or 'text' (compat mode returning stringified JSON)",
+                            enum: ["json", "text"],
+                          },
+                        },
+                        required: ["city"],
+                      },
+                    },
+                  ],
+                };
+              })();
+              return out;
+            })();
+            jsonOk({ jsonrpc: "2.0", id, result: list });
+            return;
+          }
+
+          if (method === "tools/call") {
+            const name = params?.name as string | undefined;
+            const args = (params?.arguments as unknown) ?? {};
+            if (name !== "get_weather") {
+              jsonOk({
+                jsonrpc: "2.0",
+                id,
+                result: {
+                  content: [{ type: "text", text: `Unknown tool: ${name}` }],
+                  isError: true,
+                },
+              });
+              return;
+            }
+            const out = await handleGetWeather(args);
+            jsonOk({ jsonrpc: "2.0", id, result: out });
+            return;
+          }
+
+          // Optional ping
+          if (method === "ping") {
+            jsonOk({ jsonrpc: "2.0", id, result: { ok: true } });
+            return;
+          }
+
+          // Method not found
+          jsonOk({
+            jsonrpc: "2.0",
+            id,
+            error: { code: -32601, message: `Method not found: ${method}` },
+          });
+          return;
+        }
+        // If not GET/POST, say method not allowed
+        res.writeHead(405);
+        res.end();
+        return;
+      }
 
       // Health check
       if (req.method === "GET" && pathname === "/health") {
